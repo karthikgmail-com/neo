@@ -13,6 +13,8 @@ import base64
 import pyfiglet
 import shutil
 import time
+import cv2
+import ffmpeg
 
 print("\033[94m" + pyfiglet.Figlet(font='slant').renderText("NeoRefacer") + "\033[0m")
 
@@ -56,9 +58,10 @@ def run_image(*vars):
     image_path = vars[0]
     origins = vars[1:(num_faces+1)]
     destinations = vars[(num_faces+1):(num_faces*2)+1]
-    thresholds = vars[(num_faces*2)+1:-2]
-    face_mode = vars[-2]
-    partial_reface_ratio = vars[-1]
+    thresholds = vars[(num_faces*2)+1:-3] # New slice
+    face_mode = vars[-3] # New index
+    partial_reface_ratio = vars[-2] # New index
+    enhance_quality = vars[-1] # New variable
 
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
@@ -72,16 +75,24 @@ def run_image(*vars):
                 'threshold': thresholds[k] if not multiple_faces_mode else 0.0
             })
 
-    return refacer.reface_image(image_path, faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
+    return refacer.reface_image(
+        image_path, 
+        faces, 
+        disable_similarity=disable_similarity, 
+        multiple_faces_mode=multiple_faces_mode, 
+        partial_reface_ratio=partial_reface_ratio,
+        enhance_quality=enhance_quality # Pass the new flag
+    )
 
-def run(*vars):
+def run(*vars): # Video processing
     video_path = vars[0]
     origins = vars[1:(num_faces+1)]
     destinations = vars[(num_faces+1):(num_faces*2)+1]
-    thresholds = vars[(num_faces*2)+1:-3]
-    preview = vars[-3]
-    face_mode = vars[-2]
-    partial_reface_ratio = vars[-1]
+    thresholds = vars[(num_faces*2)+1:-4] # New slice
+    preview = vars[-4] # New index
+    face_mode = vars[-3] # New index
+    partial_reface_ratio = vars[-2] # New index
+    enhance_quality = vars[-1] # New variable
 
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
@@ -95,7 +106,15 @@ def run(*vars):
                 'threshold': thresholds[k] if not multiple_faces_mode else 0.0
             })
 
-    mp4_path, gif_path = refacer.reface(video_path, faces, preview=preview, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
+    mp4_path, gif_path = refacer.reface(
+        video_path,
+        faces,
+        preview=preview,
+        disable_similarity=disable_similarity,
+        multiple_faces_mode=multiple_faces_mode,
+        partial_reface_ratio=partial_reface_ratio,
+        enhance_quality=enhance_quality # Pass the new flag
+    )
     return mp4_path, gif_path if gif_path else None
 
 def load_first_frame(filepath):
@@ -154,6 +173,143 @@ def handle_tif_preview(filepath):
     Image.open(filepath).convert('RGB').save(preview_path)
     return preview_path
 
+# refacer and num_faces are defined globally in app.py
+
+def get_image_info(image_path):
+    if image_path is None: # Handle case where image is cleared or not provided
+        return "N/A", "N/A", "N/A"
+    try:
+        # For gr.Image(type="filepath"), image_path should be a string path.
+        img = Image.open(image_path)
+        resolution = f"{img.width} x {img.height}"
+        img.close() 
+        
+        size_bytes = os.path.getsize(image_path)
+        size_mb = f"{size_bytes / (1024 * 1024):.2f} MB"
+        
+        filename = os.path.basename(image_path)
+        
+        return filename, resolution, size_mb
+    except FileNotFoundError:
+        return "File not found", "N/A", "N/A"
+    except Exception as e:
+        print(f"Error getting image info for {image_path}: {e}")
+        return "Error processing file", "Error", "Error"
+
+def update_image_inputs_and_info(filepath):
+    if filepath is None: 
+        empty_faces = [None] * num_faces # num_faces is global
+        return empty_faces + [0.0, "N/A", "N/A", "N/A"]
+
+    # refacer is global
+    extracted_faces = extract_faces_auto(filepath, refacer, max_faces=num_faces) 
+    name, res, size = get_image_info(filepath)
+    
+    # Ensure extracted_faces is always a list of length num_faces
+    if not isinstance(extracted_faces, list):
+        extracted_faces = [None] * num_faces
+    elif len(extracted_faces) < num_faces:
+        # Pad with None if fewer faces than num_faces slots are returned
+        extracted_faces.extend([None] * (num_faces - len(extracted_faces)))
+    elif len(extracted_faces) > num_faces:
+        # Truncate if more faces than num_faces slots are returned
+        extracted_faces = extracted_faces[:num_faces]
+
+    return extracted_faces + [0.0, name, res, size]
+
+
+def get_video_info(video_path):
+    if video_path is None: # Handle case where video is cleared or not provided
+        return "N/A", "N/A", "N/A", "N/A"
+    try:
+        # For gr.Video(type="filepath"), video_path should be a string path.
+        filename = os.path.basename(video_path)
+        
+        size_bytes = os.path.getsize(video_path)
+        size_mb = f"{size_bytes / (1024 * 1024):.2f} MB"
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            cap.release()
+            # Try ffprobe if cv2 fails to open
+            try:
+                probe = ffmpeg.probe(video_path)
+                video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+                if video_stream:
+                    width = int(video_stream['width'])
+                    height = int(video_stream['height'])
+                    resolution = f"{width} x {height}"
+                    duration_val = "N/A"
+                    if 'duration' in video_stream:
+                        duration_val = f"{float(video_stream['duration']):.2f} s"
+                    elif 'tags' in video_stream and 'DURATION' in video_stream['tags']:
+                        dur_str = video_stream['tags']['DURATION']
+                        h, m, s_ms = dur_str.split(':')
+                        s, ms_val = map(float, s_ms.split('.'))
+                        total_seconds = int(h) * 3600 + int(m) * 60 + s + float(ms_val)/1000
+                        duration_val = f"{total_seconds:.2f} s"
+                    return filename, resolution, size_mb, duration_val
+                else:
+                    return filename, "Error opening video", size_mb, "N/A"
+            except Exception as e_ff:
+                print(f"cv2 & ffprobe failed for {video_path}: {e_ff}")
+                return filename, "Error opening video", size_mb, "N/A"
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        resolution = f"{width} x {height}"
+        
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        duration = "N/A"
+        if fps and fps > 0 and frame_count and frame_count > 0: 
+            duration = f"{frame_count / fps:.2f} s"
+        else: # Fallback to ffprobe for duration if cv2 specific frame count/fps is problematic
+            try:
+                probe = ffmpeg.probe(video_path)
+                video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+                if video_stream:
+                    if 'duration' in video_stream:
+                        duration = f"{float(video_stream['duration']):.2f} s"
+                    elif 'tags' in video_stream and 'DURATION' in video_stream['tags']:
+                        dur_str = video_stream['tags']['DURATION']
+                        h, m, s_ms = dur_str.split(':')
+                        s, ms_val = map(float, s_ms.split('.'))
+                        total_seconds = int(h) * 3600 + int(m) * 60 + s + float(ms_val)/1000
+                        duration = f"{total_seconds:.2f} s"
+            except Exception as e_ff:
+                print(f"ffprobe fallback for duration failed for {video_path}: {e_ff}")
+
+
+        cap.release()
+        return filename, resolution, size_mb, duration
+        
+    except FileNotFoundError:
+        return "File not found", "N/A", "N/A", "N/A"
+    except Exception as e:
+        print(f"Error getting video info for {video_path}: {e}")
+        filename_val = os.path.basename(video_path) if video_path and os.path.exists(video_path) else "Error"
+        size_mb_val = f"{os.path.getsize(video_path) / (1024 * 1024):.2f} MB" if video_path and os.path.exists(video_path) else "Error"
+        return filename_val, "Error processing", size_mb_val, "Error"
+
+
+def update_video_inputs_and_info(filepath):
+    if filepath is None:
+        empty_faces = [None] * num_faces 
+        return empty_faces + [0.0, "N/A", "N/A", "N/A", "N/A"]
+
+    extracted_faces = extract_faces_auto(filepath, refacer, max_faces=num_faces, isvideo=True) 
+    name, res, size, dur = get_video_info(filepath)
+    
+    if not isinstance(extracted_faces, list): 
+        extracted_faces = [None] * num_faces
+    elif len(extracted_faces) < num_faces:
+        extracted_faces.extend([None] * (num_faces - len(extracted_faces)))
+    elif len(extracted_faces) > num_faces:
+        extracted_faces = extracted_faces[:num_faces]
+        
+    return extracted_faces + [0.0, name, res, size, dur]
+
 # --- UI ---
 theme = gr.themes.Base(primary_hue="blue", secondary_hue="cyan")
 
@@ -173,12 +329,18 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
     # --- IMAGE MODE ---
     with gr.Tab("Image Mode"):
         with gr.Row():
-            image_input = gr.Image(label="Original image", type="filepath")
+            image_input = gr.Image(label="Original image", type="filepath", file_types=['.jpeg', '.jpg', '.png'])
             image_output = gr.Image(label="Refaced image", interactive=False, type="filepath")
+        
+        with gr.Row():
+            image_filename_display = gr.Textbox(label="File Name", interactive=False)
+            image_resolution_display = gr.Textbox(label="Resolution", interactive=False)
+            image_size_display = gr.Textbox(label="File Size (MB)", interactive=False)
 
         with gr.Row():
             face_mode_image = gr.Radio(["Single Face", "Multiple Faces", "Faces By Match"], value="Single Face", label="Replacement Mode")
             partial_reface_ratio_image = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
+            enhance_quality_image = gr.Checkbox(label="Enhance Quality", value=False)
             image_btn = gr.Button("Reface Image", variant="primary")
 
         origin_image, destination_image, thresholds_image, face_tabs_image = [], [], [], []
@@ -197,133 +359,22 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         face_mode_image.change(fn=lambda mode: toggle_tabs_and_faces(mode, face_tabs_image, origin_image), inputs=[face_mode_image], outputs=face_tabs_image + origin_image)
         demo.load(fn=lambda: toggle_tabs_and_faces("Single Face", face_tabs_image, origin_image), inputs=None, outputs=face_tabs_image + origin_image)
 
-        image_btn.click(fn=run_image, inputs=[image_input] + origin_image + destination_image + thresholds_image + [face_mode_image, partial_reface_ratio_image], outputs=[image_output])
-        image_input.change(fn=lambda filepath: extract_faces_auto(filepath, refacer, max_faces=num_faces), inputs=image_input, outputs=origin_image)
-        image_input.change(fn=lambda _: 0.0, inputs=image_input, outputs=partial_reface_ratio_image)
-
-    # --- GIF MODE ---
-    with gr.Tab("GIF Mode"):
-        with gr.Row():
-            gif_input = gr.File(label="Original GIF", file_types=[".gif"])
-            gif_preview = gr.Video(label="GIF Preview", interactive=False)
-            gif_output = gr.Video(label="Refaced GIF (MP4)", interactive=False, format="mp4")
-            gif_file_output = gr.Image(label="Refaced GIF (GIF)", type="filepath")
-
-        with gr.Row():
-            face_mode_gif = gr.Radio(["Single Face", "Multiple Faces", "Faces By Match"], value="Single Face", label="Replacement Mode")
-            partial_reface_ratio_gif = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
-            gif_btn = gr.Button("Reface GIF", variant="primary")
-            preview_checkbox_gif = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
-
-        origin_gif, destination_gif, thresholds_gif, face_tabs_gif = [], [], [], []
-
-        for i in range(num_faces):
-            with gr.Tab(f"Face #{i+1}") as tab:
-                with gr.Row():
-                    origin = gr.Image(label="Face to replace")
-                    destination = gr.Image(label="Destination face")
-                threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
-            origin_gif.append(origin)
-            destination_gif.append(destination)
-            thresholds_gif.append(threshold)
-            face_tabs_gif.append(tab)
-
-        face_mode_gif.change(fn=lambda mode: toggle_tabs_and_faces(mode, face_tabs_gif, origin_gif), inputs=[face_mode_gif], outputs=face_tabs_gif + origin_gif)
-        demo.load(fn=lambda: toggle_tabs_and_faces("Single Face", face_tabs_gif, origin_gif), inputs=None, outputs=face_tabs_gif + origin_gif)
-
-        gif_btn.click(fn=run, inputs=[gif_input] + origin_gif + destination_gif + thresholds_gif + [preview_checkbox_gif, face_mode_gif, partial_reface_ratio_gif], outputs=[gif_output, gif_file_output])
-
-        gif_input.change(fn=lambda filepath: extract_faces_auto(filepath, refacer, max_faces=num_faces), inputs=gif_input, outputs=origin_gif)
-        gif_input.change(fn=lambda file: file, inputs=gif_input, outputs=[gif_preview])
-        gif_input.change(fn=lambda _: 0.0, inputs=gif_input, outputs=partial_reface_ratio_gif)
-
-        
-    # --- TIF MODE ---
-    with gr.Tab("TIFF Mode"):
-        with gr.Row():
-            tif_input = gr.File(label="Original TIF", file_types=[".tif", ".tiff"])
-            tif_preview = gr.Image(label="TIF Preview (Cover Page)", type="filepath")
-            tif_output_preview = gr.Image(label="Refaced TIF Preview (Cover Page)", type="filepath")
-            tif_output_file = gr.File(label="Refaced TIF (Download)", interactive=False)
-
-        with gr.Row():
-            face_mode_tif = gr.Radio(
-                choices=["Single Face", "Multiple Faces", "Faces By Match"],
-                value="Single Face",
-                label="Replacement Mode"
-            )
-            partial_reface_ratio_tif = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
-            tif_btn = gr.Button("Reface TIF", variant="primary")
-
-        origin_tif, destination_tif, thresholds_tif, face_tabs_tif = [], [], [], []
-
-        for i in range(num_faces):
-            with gr.Tab(f"Face #{i+1}") as tab:
-                with gr.Row():
-                    origin = gr.Image(label="Face to replace")
-                    destination = gr.Image(label="Destination face")
-                threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
-            origin_tif.append(origin)
-            destination_tif.append(destination)
-            thresholds_tif.append(threshold)
-            face_tabs_tif.append(tab)
-
-        face_mode_tif.change(
-            fn=lambda mode: toggle_tabs_and_faces(mode, face_tabs_tif, origin_tif),
-            inputs=[face_mode_tif],
-            outputs=face_tabs_tif + origin_tif
-        )
-
-        demo.load(
-            fn=lambda: toggle_tabs_and_faces("Single Face", face_tabs_tif, origin_tif),
-            inputs=None,
-            outputs=face_tabs_tif + origin_tif
-        )
-
-        def process_tif(tif_path, *vars):
-            original_img = Image.open(tif_path)
-            if hasattr(original_img, "n_frames") and original_img.n_frames > 1:
-                original_img.seek(0)
-            temp_preview_path = os.path.join("./tmp", f"tif_preview_{int(time.time() * 1000)}.jpg")
-            original_img.convert('RGB').save(temp_preview_path)
-
-            refaced_path = run_image(tif_path, *vars)
-
-            refaced_img = Image.open(refaced_path)
-            if hasattr(refaced_img, "n_frames") and refaced_img.n_frames > 1:
-                refaced_img.seek(0)
-            temp_refaced_preview_path = os.path.join("./tmp", f"refaced_tif_preview_{int(time.time() * 1000)}.jpg")
-            refaced_img.convert('RGB').save(temp_refaced_preview_path)
-
-            return temp_preview_path, temp_refaced_preview_path, refaced_path
-
-        tif_btn.click(
-            fn=lambda tif_path, *args: process_tif(tif_path, *args),
-            inputs=[tif_input] + origin_tif + destination_tif + thresholds_tif + [face_mode_tif, partial_reface_ratio_tif],
-            outputs=[tif_preview, tif_output_preview, tif_output_file]
-        )
-
-        tif_input.change(
-            fn=lambda filepath: extract_faces_auto(filepath, refacer, max_faces=num_faces),
-            inputs=tif_input,
-            outputs=origin_tif
-        )
-
-        tif_input.change(
-            fn=handle_tif_preview,
-            inputs=tif_input,
-            outputs=tif_preview
-        )
-        
-        tif_input.change(fn=lambda _: 0.0, inputs=tif_input, outputs=partial_reface_ratio_tif)
+        image_btn.click(fn=run_image, inputs=[image_input] + origin_image + destination_image + thresholds_image + [face_mode_image, partial_reface_ratio_image, enhance_quality_image], outputs=[image_output])
+        image_input.change(fn=update_image_inputs_and_info, inputs=image_input, outputs=origin_image + [partial_reface_ratio_image, image_filename_display, image_resolution_display, image_size_display])
 
 
     # --- VIDEO MODE ---
     with gr.Tab("Video Mode"):
         with gr.Row():
-            video_input = gr.Video(label="Original video", format="mp4")
+            video_input = gr.Video(label="Original video", format="mp4", file_types=['.mp4', '.mov', '.avi', '.mkv'])
             video_output = gr.Video(label="Refaced Video", interactive=False, format="mp4")
 
+        with gr.Row():
+            video_filename_display = gr.Textbox(label="File Name", interactive=False)
+            video_resolution_display = gr.Textbox(label="Resolution", interactive=False)
+            video_size_display = gr.Textbox(label="File Size (MB)", interactive=False)
+            video_duration_display = gr.Textbox(label="Duration (s)", interactive=False)
+            
         with gr.Row():
             face_mode_video = gr.Radio(
                 choices=["Single Face", "Multiple Faces", "Faces By Match"],
@@ -331,6 +382,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
                 label="Replacement Mode"
             )
             partial_reface_ratio_video = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
+            enhance_quality_video = gr.Checkbox(label="Enhance Quality", value=False)
             video_btn = gr.Button("Reface Video", variant="primary")
 
         preview_checkbox_video = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
@@ -361,16 +413,14 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         )
         
         video_input.change(
-            fn=lambda filepath: extract_faces_auto(filepath, refacer, max_faces=num_faces, isvideo=True),
+            fn=update_video_inputs_and_info,
             inputs=video_input,
-            outputs=origin_video
+            outputs=origin_video + [partial_reface_ratio_video, video_filename_display, video_resolution_display, video_size_display, video_duration_display]
         )
-        
-        video_input.change(fn=lambda _: 0.0, inputs=video_input, outputs=partial_reface_ratio_video)
 
         video_btn.click(
             fn=lambda *args: run(*args),
-            inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video],
+            inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, enhance_quality_video],
             outputs=[video_output, gr.File(visible=False)]
         )
 
