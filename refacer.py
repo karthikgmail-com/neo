@@ -305,7 +305,7 @@ class Refacer:
         if audio_stream is not None:
             self.video_has_audio = True
 
-    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0):
+    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, enhance_quality=False):
         original_name = osp.splitext(osp.basename(video_path))[0]
         timestamp = str(int(time.time()))
         filename = f"{original_name}_preview.mp4" if preview else f"{original_name}_{timestamp}.mp4"
@@ -356,17 +356,122 @@ class Refacer:
         output.release()
     
         converted_path = self.__convert_video(video_path, output_video_path, preview=preview)
-    
+
+        if enhance_quality and not preview:
+            path_with_audio = converted_path 
+            
+            base, ext = os.path.splitext(converted_path)
+            # Use a more descriptive name for the frame-enhanced video before audio merge
+            video_with_enhanced_frames_path = f"{base}_frames_enhanced{ext}"
+
+            print(f"Starting frame-by-frame enhancement for {converted_path}...")
+            cap_in = cv2.VideoCapture(converted_path)
+            
+            if not cap_in.isOpened():
+                print(f"Error: Could not open video {converted_path} for enhancement. Returning non-enhanced version.")
+                # Fallback: determine GIF path for non-enhanced video and return
+                gif_output_path_fallback = None
+                if video_path.lower().endswith(".gif"):
+                    # For previews, GIF is always from non-enhanced if preview flag is true
+                    # For non-previews, if enhancement fails, GIF is from non-enhanced.
+                    gif_dir = "output/preview" if preview else "output/gifs"
+                    gif_output_path_fallback = os.path.join(gif_dir, os.path.basename(converted_path).replace(".mp4", ".gif"))
+                    if not os.path.exists(os.path.dirname(gif_output_path_fallback)):
+                        os.makedirs(os.path.dirname(gif_output_path_fallback))
+                    if os.path.exists(converted_path): # Ensure the source video for GIF exists
+                         self.__generate_gif(converted_path, gif_output_path_fallback)
+                    else: # Source video doesn't exist, so no GIF
+                        gif_output_path_fallback = None
+                return converted_path, gif_output_path_fallback
+
+            fps_in = cap_in.get(cv2.CAP_PROP_FPS)
+            width_in = int(cap_in.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height_in = int(cap_in.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc_out = cv2.VideoWriter_fourcc(*'mp4v')
+            
+            out_enhanced = cv2.VideoWriter(video_with_enhanced_frames_path, fourcc_out, fps_in, (width_in, height_in))
+            
+            if not out_enhanced.isOpened():
+                print(f"Error: Could not open video writer for {video_with_enhanced_frames_path}. Returning non-enhanced version.")
+                cap_in.release()
+                gif_output_path_fallback = None # Similar fallback logic for GIF
+                if video_path.lower().endswith(".gif"):
+                    gif_dir = "output/preview" if preview else "output/gifs"
+                    gif_output_path_fallback = os.path.join(gif_dir, os.path.basename(converted_path).replace(".mp4", ".gif"))
+                    if not os.path.exists(os.path.dirname(gif_output_path_fallback)):
+                        os.makedirs(os.path.dirname(gif_output_path_fallback))
+                    if os.path.exists(converted_path):
+                        self.__generate_gif(converted_path, gif_output_path_fallback)
+                    else:
+                        gif_output_path_fallback = None
+                return converted_path, gif_output_path_fallback
+
+            total_frames_in = int(cap_in.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            with tqdm(total=total_frames_in, desc="Enhancing video frames") as pbar_enhance:
+                while True:
+                    ret, frame = cap_in.read()
+                    if not ret:
+                        break
+                    enhanced_frame = enhance_image_memory(frame) 
+                    out_enhanced.write(enhanced_frame)
+                    pbar_enhance.update(1)
+            
+            cap_in.release()
+            out_enhanced.release()
+            print(f"Video with enhanced frames saved to: {video_with_enhanced_frames_path}")
+
+            final_video_path_after_enhancement = video_with_enhanced_frames_path # Default if no audio or merge fails
+            if self.video_has_audio:
+                print(f"Adding audio back to enhanced video: {video_with_enhanced_frames_path}")
+                # More descriptive name for the final enhanced video with audio
+                final_enhanced_video_path_with_audio = f"{base}_enhanced_audio{ext}"
+                
+                in_video_enhanced_stream = ffmpeg.input(video_with_enhanced_frames_path)
+                in_audio_source_stream = ffmpeg.input(path_with_audio)
+
+                try:
+                    ffmpeg.output(
+                        in_video_enhanced_stream.video, 
+                        in_audio_source_stream.audio, 
+                        final_enhanced_video_path_with_audio, 
+                        vcodec='copy', 
+                        acodec='aac', 
+                        strict='experimental'
+                    ).overwrite_output().run(quiet=True)
+                    
+                    print(f"Audio merged. Final enhanced video at: {final_enhanced_video_path_with_audio}")
+                    
+                    if os.path.exists(video_with_enhanced_frames_path):
+                        os.remove(video_with_enhanced_frames_path)
+                    # Remove original converted_path if it's different from the final output and not the user's initial input video
+                    if path_with_audio != video_path and path_with_audio != final_enhanced_video_path_with_audio and os.path.exists(path_with_audio):
+                        os.remove(path_with_audio)
+                        
+                    final_video_path_after_enhancement = final_enhanced_video_path_with_audio
+                except ffmpeg.Error as e:
+                    print(f"ffmpeg error during audio merge for enhanced video: {e.stderr.decode('utf8') if hasattr(e.stderr, 'decode') else e}")
+                    print(f"Proceeding with enhanced video (no audio): {video_with_enhanced_frames_path}")
+                    # final_video_path_after_enhancement is already video_with_enhanced_frames_path
+            
+            converted_path = final_video_path_after_enhancement
+            print(f"Final processed video path: {converted_path}")
+
+
+        gif_output_path = None
         if video_path.lower().endswith(".gif"):
-            if preview:
-                gif_output_path = os.path.join("output", "preview", os.path.basename(converted_path).replace(".mp4", ".gif"))
+            gif_dir = "output/preview" if preview else "output/gifs" # Preview GIFs are from non-enhanced.
+            # If enhancing and it's not a preview, GIF is from the (potentially) enhanced converted_path
+            gif_output_path = os.path.join(gif_dir, os.path.basename(converted_path).replace(".mp4", ".gif"))
+            
+            os.makedirs(os.path.dirname(gif_output_path), exist_ok=True)
+            if os.path.exists(converted_path): # Ensure source for GIF exists
+                self.__generate_gif(converted_path, gif_output_path)
             else:
-                gif_output_path = os.path.join("output", "gifs", os.path.basename(converted_path).replace(".mp4", ".gif"))
-    
-            self.__generate_gif(converted_path, gif_output_path)
-            return converted_path, gif_output_path
-    
-        return converted_path, None
+                print(f"Source video for GIF ({converted_path}) not found. Skipping GIF generation.")
+                gif_output_path = None
+
+        return converted_path, gif_output_path
     
    
   
@@ -395,7 +500,7 @@ class Refacer:
         print(f"Refaced video saved at: {os.path.abspath(new_path)}")
         return new_path
 
-    def reface_image(self, image_path, faces, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0):
+    def reface_image(self, image_path, faces, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, enhance_quality=False):
          self.prepare_faces(faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode)
          self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
          self.partial_reface_ratio = partial_reface_ratio
@@ -424,15 +529,22 @@ class Refacer:
                      pil_img.seek(page)
                      bgr_image = cv2.cvtColor(np.array(pil_img.convert('RGB')), cv2.COLOR_RGB2BGR)
                      refaced_bgr = self.process_first_face(bgr_image.copy()) if self.first_face else self.process_faces(bgr_image.copy())
-                     enhanced_bgr = enhance_image_memory(refaced_bgr)
-                     enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
-                     enhanced_pil = Image.fromarray(enhanced_rgb)
-                     frames.append(enhanced_pil)
+                     if enhance_quality:
+                         processed_bgr = enhance_image_memory(refaced_bgr)
+                     else:
+                         processed_bgr = refaced_bgr
+                    
+                     processed_rgb = cv2.cvtColor(processed_bgr, cv2.COLOR_BGR2RGB)
+                     processed_pil = Image.fromarray(processed_rgb)
+                     frames.append(processed_pil)
                      pbar.update(1)
  
              output_path = os.path.join("output", f"{original_name}_{timestamp}.tif")
              frames[0].save(output_path, save_all=True, append_images=frames[1:], compression="tiff_deflate")
-             print(f"Saved multipage refaced TIFF to {output_path}")
+             if enhance_quality:
+                 print(f"Saved enhanced multipage refaced TIFF to {output_path}")
+             else:
+                 print(f"Saved multipage refaced TIFF (no enhancement) to {output_path}")
              return output_path
  
          else:
@@ -445,10 +557,17 @@ class Refacer:
              pil_img = Image.fromarray(refaced_rgb)
              filename = f"{original_name}_{timestamp}.jpg"
              output_path = os.path.join("output", filename)
-             pil_img.save(output_path, format='JPEG', quality=100, subsampling=0)
-             output_path = enhance_image(output_path)
-             print(f"Saved refaced image to {output_path}")
-             return output_path
+             pil_img.save(output_path, format='JPEG', quality=100, subsampling=0) # Save refaced image
+
+             if enhance_quality:
+                 # enhance_image saves to a new path (e.g., original.enhanced.jpg)
+                 # and returns that new path.
+                 enhanced_output_path = enhance_image(output_path) 
+                 print(f"Enhanced image saved to {enhanced_output_path}")
+                 return enhanced_output_path # Return the path of the enhanced image
+             else:
+                 print(f"Refaced image (no enhancement) saved to {output_path}")
+                 return output_path # Return the path of the non-enhanced refaced image
 
 
     def extract_faces_from_image(self, image_path, max_faces=5):
